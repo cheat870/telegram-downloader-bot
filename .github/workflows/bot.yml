@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # restart រៀងរាល់ 6 ម៉ោង
 
 jobs:
   run-bot:
