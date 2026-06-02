@@ -36,6 +36,8 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           LOG_CHANNEL_ID: ${{ secrets.LOG_CHANNEL_ID }}
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          MAX_VIDEO_HEIGHT: "2160"
+          MAX_FILE_SIZE_MB: "2048"
         run: |
           set +e
           timeout 350m python bot_download.py

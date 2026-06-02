@@ -35,7 +35,6 @@ except ValueError:
 bot = telebot.TeleBot(API_TOKEN)
 
 DOWNLOAD_FOLDER = "downloads"
-MAX_FILE_SIZE = 50 * 1024 * 1024
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 COOKIES = {
@@ -45,6 +44,32 @@ COOKIES = {
 }
 
 USERS_FILE = "users.json"
+
+
+def read_positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+MAX_VIDEO_HEIGHT = read_positive_int_env("MAX_VIDEO_HEIGHT", 2160)
+MAX_FILE_SIZE_MB = read_positive_int_env("MAX_FILE_SIZE_MB", 2048)
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+def quality_label() -> str:
+    if MAX_VIDEO_HEIGHT >= 2160:
+        return "4K"
+    return f"{MAX_VIDEO_HEIGHT}p"
+
+
+def format_size(size_bytes: int) -> str:
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb >= 1024:
+        return f"{size_mb / 1024:.1f} GB"
+    return f"{size_mb:.0f} MB"
 
 
 # ═════════════════════════════════════════════
@@ -248,9 +273,10 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
 
     if platform == "youtube":
         opts["format"] = (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=720]+bestaudio/"
-            "best[height<=720]/best"
+            f"bestvideo[height<={MAX_VIDEO_HEIGHT}][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={MAX_VIDEO_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/"
+            f"best[height<={MAX_VIDEO_HEIGHT}]/best"
         )
     elif platform == "tiktok":
         opts["format"] = "best"
@@ -271,19 +297,19 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
         if os.path.exists(COOKIES["instagram"]):
             opts["cookiefile"] = COOKIES["instagram"]
     elif platform == "twitter":
-        opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        opts["format"] = f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]/best"
     elif platform == "reddit":
         opts["format"] = "best[ext=mp4]/best"
     elif platform == "twitch":
-        opts["format"] = "best[height<=720][ext=mp4]/best[height<=720]/best"
+        opts["format"] = f"best[height<={MAX_VIDEO_HEIGHT}][ext=mp4]/best[height<={MAX_VIDEO_HEIGHT}]/best"
     elif platform in ("vimeo", "bilibili"):
-        opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        opts["format"] = f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]/best"
     else:
         opts["format"] = (
-            "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=720]+bestaudio/"
-            "best[height<=720][ext=mp4]/"
-            "best[height<=720]/best"
+            f"bestvideo[height<={MAX_VIDEO_HEIGHT}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/"
+            f"best[height<={MAX_VIDEO_HEIGHT}][ext=mp4]/"
+            f"best[height<={MAX_VIDEO_HEIGHT}]/best"
         )
 
     return opts
@@ -416,7 +442,7 @@ def send_welcome(message):
         "• Vimeo • Dailymotion • Twitch\n"
         "• Bilibili • Streamable • Rumble\n"
         "• Pinterest • Threads • និងច្រើន​ទៀត!\n\n"
-        "📽️ Format: MP4  |  Max: 50 MB",
+        f"📽️ Format: MP4  |  Quality: up to {quality_label()}  |  Max: {format_size(MAX_FILE_SIZE)}",
         parse_mode="Markdown"
     )
 
@@ -432,7 +458,7 @@ def send_help(message):
         "• Vimeo • Dailymotion • Twitch\n"
         "• Bilibili • Streamable • Rumble\n"
         "• Pinterest • Threads • និងច្រើន​ទៀត!\n\n"
-        "📽️ Format: MP4  |  Max: 50 MB\n\n"
+        f"📽️ Format: MP4  |  Quality: up to {quality_label()}  |  Max: {format_size(MAX_FILE_SIZE)}\n\n"
         "⚠️ *TikTok/FB Private* → ត្រូវ​ការ cookies file\n\n"
         "💡 គ្រាន់​តែ​ paste link វីដេអូ​មក!",
         parse_mode="Markdown"
@@ -561,7 +587,7 @@ def download_video(message):
     output_template = os.path.join(download_dir, "%(title).80s.%(ext)s")
 
     bot.edit_message_text(
-        f"⬇️ កំពុង Download... [{platform.upper()}]",
+        f"⬇️ កំពុង Download... [{platform.upper()} | {quality_label()}]",
         message.chat.id, msg.message_id
     )
 
@@ -586,7 +612,7 @@ def download_video(message):
     if file_size > MAX_FILE_SIZE:
         bot.edit_message_text(
             f"❌ វីដេអូ​ធំ​ពេក ({size_mb:.1f} MB)\n"
-            f"Telegram ទទួល​បាន​តែ 50 MB ប៉ុណ្ណោះ។",
+            f"Bot ទទួល​បាន​តែ {format_size(MAX_FILE_SIZE)} ប៉ុណ្ណោះ។",
             message.chat.id, msg.message_id
         )
         log_download(user, url, f"too large ({size_mb:.1f}MB)", platform, size_mb)
@@ -602,9 +628,9 @@ def download_video(message):
                 bot.send_video(
                     message.chat.id,
                     video,
-                    timeout=120,
+                    timeout=600,
                     supports_streaming=True,
-                    caption=f"✅ {size_mb:.1f} MB | {platform.upper()} | MP4"
+                    caption=f"✅ {size_mb:.1f} MB | {platform.upper()} | {quality_label()} | MP4"
                 )
             upload_ok = True
             break
