@@ -1,17 +1,20 @@
-name: Telegram Bot CI
+name: Telegram Bot
 
 concurrency:
-  group: telegram-bot-ci
+  group: telegram-bot
   cancel-in-progress: true
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
-  smoke-test:
+  run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - name: Setup Python
@@ -25,3 +28,17 @@ jobs:
           sudo apt-get install -y ffmpeg
       - name: Validate bot syntax
         run: python -m py_compile bot_download.py
+      - name: Run Bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          LOG_CHANNEL_ID: ${{ secrets.LOG_CHANNEL_ID }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+        run: |
+          set +e
+          timeout 350m python bot_download.py
+          exit_code=$?
+          if [ "$exit_code" = "124" ]; then
+            echo "Bot run reached the scheduled restart window."
+            exit 0
+          fi
+          exit "$exit_code"
