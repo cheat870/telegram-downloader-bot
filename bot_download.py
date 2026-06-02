@@ -1,17 +1,19 @@
 import os
-import re
 import json
+import shutil
+import uuid
 import telebot
 from yt_dlp import YoutubeDL
 from typing import Any
 from dotenv import load_dotenv
 from datetime import datetime
+from urllib.parse import urlparse
 
 load_dotenv()
 
-API_TOKEN      = os.getenv("BOT_TOKEN", "BOT_TOKEN")
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "LOG_CHANNEL_ID")
-ADMIN_ID       = os.getenv("ADMIN_USER_ID", "1667275809")
+API_TOKEN      = os.getenv("BOT_TOKEN")
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
+ADMIN_ID       = os.getenv("ADMIN_USER_ID")
 
 if not API_TOKEN:
     raise ValueError("BOT_TOKEN not found!")
@@ -33,6 +35,7 @@ except ValueError:
 bot = telebot.TeleBot(API_TOKEN)
 
 DOWNLOAD_FOLDER = "downloads"
+MAX_FILE_SIZE = 50 * 1024 * 1024
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 COOKIES = {
@@ -162,28 +165,40 @@ def log_download(user, url: str, status: str, platform: str = "?", size_mb: floa
 # ═════════════════════════════════════════════
 
 def detect_platform(url: str) -> str:
-    patterns = {
-        "youtube":     r"(youtube\.com|youtu\.be)",
-        "tiktok":      r"(tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)",
-        "facebook":    r"(facebook\.com|fb\.watch|fb\.com)",
-        "instagram":   r"(instagram\.com)",
-        "twitter":     r"(twitter\.com|x\.com|t\.co)",
-        "reddit":      r"(reddit\.com|redd\.it)",
-        "vimeo":       r"(vimeo\.com)",
-        "dailymotion": r"(dailymotion\.com|dai\.ly)",
-        "twitch":      r"(twitch\.tv|clips\.twitch\.tv)",
-        "pinterest":   r"(pinterest\.com|pin\.it)",
-        "threads":     r"(threads\.net)",
-        "bilibili":    r"(bilibili\.com|b23\.tv)",
-        "streamable":  r"(streamable\.com)",
-        "rumble":      r"(rumble\.com)",
-        "odysee":      r"(odysee\.com)",
-        "soundcloud":  r"(soundcloud\.com)",
+    hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    domains = {
+        "youtube":     ("youtube.com", "youtu.be"),
+        "tiktok":      ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
+        "facebook":    ("facebook.com", "fb.watch", "fb.com"),
+        "instagram":   ("instagram.com",),
+        "twitter":     ("twitter.com", "x.com"),
+        "reddit":      ("reddit.com", "redd.it"),
+        "vimeo":       ("vimeo.com",),
+        "dailymotion": ("dailymotion.com", "dai.ly"),
+        "twitch":      ("twitch.tv", "clips.twitch.tv"),
+        "pinterest":   ("pinterest.com", "pin.it"),
+        "threads":     ("threads.net",),
+        "bilibili":    ("bilibili.com", "b23.tv"),
+        "streamable":  ("streamable.com",),
+        "rumble":      ("rumble.com",),
+        "odysee":      ("odysee.com",),
+        "soundcloud":  ("soundcloud.com",),
     }
-    for platform, pattern in patterns.items():
-        if re.search(pattern, url, re.IGNORECASE):
+    for platform, platform_domains in domains.items():
+        if any(hostname == domain or hostname.endswith(f".{domain}") for domain in platform_domains):
             return platform
     return "generic"
+
+
+def validate_url(url: str) -> tuple[bool, str]:
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False, "Invalid URL. Please send a valid http/https link."
+    if parsed.username or parsed.password:
+        return False, "URLs with embedded credentials are not allowed."
+    if detect_platform(url) == "generic":
+        return False, "Unsupported platform. Please send a link from a supported video site."
+    return True, ""
 
 
 # ═════════════════════════════════════════════
@@ -209,6 +224,7 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
         "outtmpl":             output_template,
         "merge_output_format": "mp4",
         "noplaylist":          True,
+        "max_filesize":        MAX_FILE_SIZE,
         "retries":             10,
         "fragment_retries":    10,
         "geo_bypass":          True,
@@ -273,7 +289,7 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
     return opts
 
 
-def resolve_file_path(ydl: YoutubeDL, info_dict: dict) -> str | None:
+def resolve_file_path(ydl: YoutubeDL, info_dict: dict, download_dir: str) -> str | None:
     path = ydl.prepare_filename(info_dict)
     if os.path.exists(path):
         return path
@@ -282,9 +298,9 @@ def resolve_file_path(ydl: YoutubeDL, info_dict: dict) -> str | None:
         return mp4
     try:
         files = [
-            os.path.join(DOWNLOAD_FOLDER, f)
-            for f in os.listdir(DOWNLOAD_FOLDER)
-            if os.path.isfile(os.path.join(DOWNLOAD_FOLDER, f))
+            os.path.join(download_dir, f)
+            for f in os.listdir(download_dir)
+            if os.path.isfile(os.path.join(download_dir, f))
         ]
         if files:
             return max(files, key=os.path.getctime)
@@ -293,7 +309,7 @@ def resolve_file_path(ydl: YoutubeDL, info_dict: dict) -> str | None:
     return None
 
 
-def attempt_download(url: str, output_template: str) -> tuple[str | None, str | None]:
+def attempt_download(url: str, output_template: str, download_dir: str) -> tuple[str | None, str | None]:
     last_error = "Unknown error"
 
     for mobile_ua in [False, True]:
@@ -303,7 +319,7 @@ def attempt_download(url: str, output_template: str) -> tuple[str | None, str | 
             opts = build_ydl_opts(url, output_template, mobile_ua=mobile_ua)
             with YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
                 info = ydl.extract_info(url, download=True)
-                path = resolve_file_path(ydl, info)
+                path = resolve_file_path(ydl, info, download_dir)
                 if path:
                     return path, None
         except Exception as e:
@@ -317,6 +333,7 @@ def attempt_download(url: str, output_template: str) -> tuple[str | None, str | 
             "outtmpl":    output_template,
             "format":     "best",
             "noplaylist": True,
+            "max_filesize": MAX_FILE_SIZE,
             "retries":    5,
             "geo_bypass": True,
             "http_headers": {
@@ -331,7 +348,7 @@ def attempt_download(url: str, output_template: str) -> tuple[str | None, str | 
             bare["cookiefile"] = COOKIES[platform]
         with YoutubeDL(bare) as ydl:  # type: ignore[arg-type]
             info = ydl.extract_info(url, download=True)
-            path = resolve_file_path(ydl, info)
+            path = resolve_file_path(ydl, info, download_dir)
             if path:
                 return path, None
     except Exception as e:
@@ -525,11 +542,13 @@ def stats(message):
 def download_video(message):
     url      = message.text.strip()
     user     = message.from_user
-    platform = detect_platform(url)
+    is_valid, validation_error = validate_url(url)
 
-    if not url.startswith("http"):
-        bot.reply_to(message, "⚠️ សូម​ផ្ញើ URL ត្រឹម​ត្រូវ (ចាប់ផ្ដើម​ដោយ http/https)")
+    if not is_valid:
+        bot.reply_to(message, validation_error)
         return
+
+    platform = detect_platform(url)
 
     msg = bot.send_message(
         message.chat.id,
@@ -537,19 +556,22 @@ def download_video(message):
     )
 
     size_mb : float = 0.0
-    output_template = f"{DOWNLOAD_FOLDER}/%(title).80s.%(ext)s"
+    download_dir = os.path.join(DOWNLOAD_FOLDER, f"{user.id}_{message.message_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(download_dir, exist_ok=True)
+    output_template = os.path.join(download_dir, "%(title).80s.%(ext)s")
 
     bot.edit_message_text(
         f"⬇️ កំពុង Download... [{platform.upper()}]",
         message.chat.id, msg.message_id
     )
 
-    file_path, err = attempt_download(url, output_template)
+    file_path, err = attempt_download(url, output_template, download_dir)
 
     if file_path is None:
         reply = friendly_error(err or "Unknown error", platform)
         bot.edit_message_text(reply, message.chat.id, msg.message_id, parse_mode="Markdown")
         log_download(user, url, f"error: {(err or '')[:100]}", platform, 0.0)
+        shutil.rmtree(download_dir, ignore_errors=True)
         return
 
     try:
@@ -558,16 +580,17 @@ def download_video(message):
     except OSError:
         bot.edit_message_text("❌ File រក​មិន​ឃើញ​ក្រោយ Download។", message.chat.id, msg.message_id)
         log_download(user, url, "error: file missing", platform)
+        shutil.rmtree(download_dir, ignore_errors=True)
         return
 
-    if file_size > 50 * 1024 * 1024:
+    if file_size > MAX_FILE_SIZE:
         bot.edit_message_text(
             f"❌ វីដេអូ​ធំ​ពេក ({size_mb:.1f} MB)\n"
             f"Telegram ទទួល​បាន​តែ 50 MB ប៉ុណ្ណោះ។",
             message.chat.id, msg.message_id
         )
         log_download(user, url, f"too large ({size_mb:.1f}MB)", platform, size_mb)
-        os.remove(file_path)
+        shutil.rmtree(download_dir, ignore_errors=True)
         return
 
     bot.edit_message_text("📤 កំពុង Upload...", message.chat.id, msg.message_id)
@@ -602,8 +625,7 @@ def download_video(message):
         bot.edit_message_text("✅ រួច​រាល់!", message.chat.id, msg.message_id)
         log_download(user, url, "success", platform, size_mb)
 
-    if file_path and os.path.exists(file_path):
-        os.remove(file_path)
+    shutil.rmtree(download_dir, ignore_errors=True)
 
 
 print("Bot is running...")

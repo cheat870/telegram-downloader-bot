@@ -1,3 +1,7 @@
 .env
 .env/
 users.json
+__pycache__/
+*.py[cod]
+downloads/
+*_cookies.txt
