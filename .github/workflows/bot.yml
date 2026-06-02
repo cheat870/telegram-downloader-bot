@@ -1,32 +1,27 @@
-name: Telegram Bot
+name: Telegram Bot CI
 
 concurrency:
-  group: telegram-bot
+  group: telegram-bot-ci
   cancel-in-progress: true
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "0 */6 * * *"
 
 jobs:
-  run-bot:
+  smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           sudo apt-get install -y ffmpeg
-      - name: Run Bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          LOG_CHANNEL_ID: ${{ secrets.LOG_CHANNEL_ID }}
-          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
-        run: python bot_download.py
+      - name: Validate bot syntax
+        run: python -m py_compile bot_download.py
