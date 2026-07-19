@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import threading
 import uuid
 import telebot
 from yt_dlp import YoutubeDL
@@ -8,6 +9,11 @@ from typing import Any
 from dotenv import load_dotenv
 from datetime import datetime
 from urllib.parse import urlparse
+
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 load_dotenv()
 
@@ -44,6 +50,7 @@ COOKIES = {
 }
 
 USERS_FILE = "users.json"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 def read_positive_int_env(name: str, default: int) -> int:
@@ -57,6 +64,20 @@ def read_positive_int_env(name: str, default: int) -> int:
 MAX_VIDEO_HEIGHT = read_positive_int_env("MAX_VIDEO_HEIGHT", 2160)
 MAX_FILE_SIZE_MB = read_positive_int_env("MAX_FILE_SIZE_MB", 2048)
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_ITEMS_PER_REQUEST = read_positive_int_env("MAX_ITEMS_PER_REQUEST", 5)
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"}
+SKIP_FILE_SUFFIXES = (
+    ".part",
+    ".tmp",
+    ".temp",
+    ".ytdl",
+    ".json",
+    ".description",
+    ".info.json",
+)
 
 
 def quality_label() -> str:
@@ -76,8 +97,101 @@ def format_size(size_bytes: int) -> str:
 #  PERSISTENT USER STORAGE
 # ═════════════════════════════════════════════
 
+def database_enabled() -> bool:
+    return bool(DATABASE_URL and psycopg is not None)
+
+
+def ensure_users_table() -> bool:
+    if not database_enabled():
+        return False
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_users (
+                        user_id BIGINT PRIMARY KEY,
+                        name TEXT NOT NULL DEFAULT '',
+                        username TEXT NOT NULL DEFAULT '',
+                        language_code TEXT NOT NULL DEFAULT '',
+                        joined TEXT NOT NULL,
+                        last_seen TEXT NOT NULL
+                    )
+                    """
+                )
+        return True
+    except Exception as e:
+        print(f"[DATABASE INIT ERROR] {e}")
+        return False
+
+
+def load_users_from_database() -> dict[int, dict]:
+    if not ensure_users_table():
+        return {}
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT user_id, name, username, language_code, joined, last_seen
+                    FROM bot_users
+                    """
+                )
+                return {
+                    int(row[0]): {
+                        "name": row[1],
+                        "username": row[2],
+                        "language_code": row[3],
+                        "joined": row[4],
+                        "last_seen": row[5],
+                    }
+                    for row in cur.fetchall()
+                }
+    except Exception as e:
+        print(f"[DATABASE LOAD ERROR] {e}")
+        return {}
+
+
+def save_user_to_database(user_id: int, user_data: dict) -> bool:
+    if not ensure_users_table():
+        return False
+
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_users (user_id, name, username, language_code, joined, last_seen)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        username = EXCLUDED.username,
+                        language_code = EXCLUDED.language_code,
+                        last_seen = EXCLUDED.last_seen
+                    """,
+                    (
+                        user_id,
+                        user_data.get("name", ""),
+                        user_data.get("username", ""),
+                        user_data.get("language_code", ""),
+                        user_data.get("joined", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        user_data.get("last_seen", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    ),
+                )
+        return True
+    except Exception as e:
+        print(f"[DATABASE SAVE ERROR] {e}")
+        return False
+
+
 def load_users() -> dict[int, dict]:
     """Load users from JSON file. Returns {user_id: {name, username, joined}}"""
+    database_users = load_users_from_database()
+    if database_users:
+        return database_users
+
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
@@ -90,9 +204,18 @@ def load_users() -> dict[int, dict]:
 
 
 def save_users(users: dict[int, dict]) -> None:
+    if database_enabled():
+        saved_all = True
+        for user_id, user_data in users.items():
+            saved_all = save_user_to_database(user_id, user_data) and saved_all
+        if saved_all:
+            return
+
     try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
+        tmp_file = f"{USERS_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(users, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, USERS_FILE)
     except Exception as e:
         print(f"[USERS SAVE ERROR] {e}")
 
@@ -100,6 +223,36 @@ def save_users(users: dict[int, dict]) -> None:
 # Load into memory on startup
 all_users: dict[int, dict] = load_users()
 notified_users: set[int] = set(all_users.keys())
+users_lock = threading.Lock()
+
+
+def user_full_name(user) -> str:
+    full_name = user.first_name or ""
+    if user.last_name:
+        full_name += f" {user.last_name}"
+    return full_name.strip() or "Unknown"
+
+
+def store_user(user) -> bool:
+    """Persist any user who talks to the bot, even if they skip /start."""
+    if user is None or getattr(user, "id", None) is None:
+        return False
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with users_lock:
+        existing = all_users.get(user.id, {})
+        was_new = user.id not in all_users
+        all_users[user.id] = {
+            "name": user_full_name(user),
+            "username": user.username or "",
+            "language_code": user.language_code or "",
+            "joined": existing.get("joined", now),
+            "last_seen": now,
+        }
+        save_users(all_users)
+        if was_new:
+            notified_users.add(user.id)
+    return was_new
 
 
 # ═════════════════════════════════════════════
@@ -230,7 +383,12 @@ def validate_url(url: str) -> tuple[bool, str]:
 #  YT-DLP OPTIONS
 # ═════════════════════════════════════════════
 
-def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> dict[str, Any]:
+def build_ydl_opts(
+    url: str,
+    output_template: str,
+    mobile_ua: bool = False,
+    allow_playlist: bool = False,
+) -> dict[str, Any]:
     platform = detect_platform(url)
 
     desktop_ua = (
@@ -248,12 +406,13 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
     opts: dict[str, Any] = {
         "outtmpl":             output_template,
         "merge_output_format": "mp4",
-        "noplaylist":          True,
+        "noplaylist":          not allow_playlist,
         "max_filesize":        MAX_FILE_SIZE,
         "retries":             10,
         "fragment_retries":    10,
         "geo_bypass":          True,
         "socket_timeout":      30,
+        "ignoreerrors":        allow_playlist,
         "http_headers": {
             "User-Agent":      ua,
             "Accept-Language": "en-US,en;q=0.9",
@@ -270,6 +429,8 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
             "-strict", "experimental",
         ],
     }
+    if allow_playlist:
+        opts["playlistend"] = MAX_ITEMS_PER_REQUEST
 
     if platform == "youtube":
         opts["format"] = (
@@ -315,7 +476,59 @@ def build_ydl_opts(url: str, output_template: str, mobile_ua: bool = False) -> d
     return opts
 
 
+def is_sendable_file(path: str) -> bool:
+    lower = path.lower()
+    if any(lower.endswith(suffix) for suffix in SKIP_FILE_SUFFIXES):
+        return False
+    return os.path.isfile(path)
+
+
+def collect_downloaded_files(download_dir: str) -> list[str]:
+    try:
+        files = [
+            os.path.join(download_dir, f)
+            for f in os.listdir(download_dir)
+            if is_sendable_file(os.path.join(download_dir, f))
+        ]
+    except Exception:
+        return []
+    return sorted(files, key=os.path.getctime)
+
+
+def resolve_file_paths(ydl: YoutubeDL, info_dict: dict, download_dir: str) -> list[str]:
+    candidates: list[str] = []
+
+    def add_candidate(info: dict | None) -> None:
+        if not info:
+            return
+        try:
+            path = ydl.prepare_filename(info)
+        except Exception:
+            return
+        candidates.append(path)
+        candidates.append(os.path.splitext(path)[0] + ".mp4")
+
+    if isinstance(info_dict, dict) and info_dict.get("entries"):
+        for entry in info_dict.get("entries") or []:
+            add_candidate(entry)
+    else:
+        add_candidate(info_dict)
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for path in candidates + collect_downloaded_files(download_dir):
+        if path in seen or not is_sendable_file(path):
+            continue
+        seen.add(path)
+        resolved.append(path)
+
+    return resolved
+
+
 def resolve_file_path(ydl: YoutubeDL, info_dict: dict, download_dir: str) -> str | None:
+    paths = resolve_file_paths(ydl, info_dict, download_dir)
+    if paths:
+        return paths[0]
     path = ydl.prepare_filename(info_dict)
     if os.path.exists(path):
         return path
@@ -335,19 +548,29 @@ def resolve_file_path(ydl: YoutubeDL, info_dict: dict, download_dir: str) -> str
     return None
 
 
-def attempt_download(url: str, output_template: str, download_dir: str) -> tuple[str | None, str | None]:
+def attempt_download(
+    url: str,
+    output_template: str,
+    download_dir: str,
+    allow_playlist: bool = False,
+) -> tuple[list[str], str | None]:
     last_error = "Unknown error"
 
     for mobile_ua in [False, True]:
         label = "Mobile UA" if mobile_ua else "Desktop UA"
         print(f"[ATTEMPT] {label}")
         try:
-            opts = build_ydl_opts(url, output_template, mobile_ua=mobile_ua)
+            opts = build_ydl_opts(
+                url,
+                output_template,
+                mobile_ua=mobile_ua,
+                allow_playlist=allow_playlist,
+            )
             with YoutubeDL(opts) as ydl:  # type: ignore[arg-type]
                 info = ydl.extract_info(url, download=True)
-                path = resolve_file_path(ydl, info, download_dir)
-                if path:
-                    return path, None
+                paths = resolve_file_paths(ydl, info, download_dir)
+                if paths:
+                    return paths[:MAX_ITEMS_PER_REQUEST], None
         except Exception as e:
             last_error = str(e)
             print(f"[FAILED] {label} → {last_error[:120]}")
@@ -358,10 +581,11 @@ def attempt_download(url: str, output_template: str, download_dir: str) -> tuple
         bare: dict[str, Any] = {
             "outtmpl":    output_template,
             "format":     "best",
-            "noplaylist": True,
+            "noplaylist": not allow_playlist,
             "max_filesize": MAX_FILE_SIZE,
             "retries":    5,
             "geo_bypass": True,
+            "ignoreerrors": allow_playlist,
             "http_headers": {
                 "User-Agent": (
                     "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
@@ -370,18 +594,20 @@ def attempt_download(url: str, output_template: str, download_dir: str) -> tuple
                 ),
             },
         }
+        if allow_playlist:
+            bare["playlistend"] = MAX_ITEMS_PER_REQUEST
         if platform in COOKIES and os.path.exists(COOKIES[platform]):
             bare["cookiefile"] = COOKIES[platform]
         with YoutubeDL(bare) as ydl:  # type: ignore[arg-type]
             info = ydl.extract_info(url, download=True)
-            path = resolve_file_path(ydl, info, download_dir)
-            if path:
-                return path, None
+            paths = resolve_file_paths(ydl, info, download_dir)
+            if paths:
+                return paths[:MAX_ITEMS_PER_REQUEST], None
     except Exception as e:
         last_error = str(e)
         print(f"[FAILED] Ultra-bare → {last_error[:120]}")
 
-    return None, last_error
+    return [], last_error
 
 
 def friendly_error(err: str, platform: str) -> str:
@@ -414,6 +640,155 @@ def friendly_error(err: str, platform: str) -> str:
     return f"❌ Error: {err[:200]}"
 
 
+def send_downloaded_media(chat_id: int, file_path: str, caption: str) -> None:
+    ext = os.path.splitext(file_path)[1].lower()
+    with open(file_path, "rb") as media:
+        if ext in VIDEO_EXTENSIONS:
+            bot.send_video(
+                chat_id,
+                media,
+                timeout=600,
+                supports_streaming=True,
+                caption=caption,
+            )
+        elif ext in PHOTO_EXTENSIONS:
+            try:
+                bot.send_photo(chat_id, media, timeout=600, caption=caption)
+            except Exception:
+                media.seek(0)
+                bot.send_document(chat_id, media, timeout=600, caption=caption)
+        elif ext in AUDIO_EXTENSIONS:
+            bot.send_audio(chat_id, media, timeout=600, caption=caption)
+        else:
+            bot.send_document(chat_id, media, timeout=600, caption=caption)
+
+
+def extract_request_url(message, allow_playlist: bool) -> str:
+    text = (message.text or "").strip()
+    if allow_playlist:
+        return text.partition(" ")[2].strip()
+    return text
+
+
+def process_download_request(message, allow_playlist: bool = False) -> None:
+    user = message.from_user
+    if user is None:
+        bot.reply_to(message, "Please send the link from a user chat.")
+        return
+
+    was_new = store_user(user)
+    if was_new:
+        log_user_join(user)
+
+    url = extract_request_url(message, allow_playlist)
+    if not url:
+        bot.reply_to(message, f"Usage: /all <video or playlist URL> (max {MAX_ITEMS_PER_REQUEST} files)")
+        return
+
+    is_valid, validation_error = validate_url(url)
+    if not is_valid:
+        bot.reply_to(message, validation_error)
+        return
+
+    platform = detect_platform(url)
+    request_label = f"ALL up to {MAX_ITEMS_PER_REQUEST}" if allow_playlist else quality_label()
+
+    msg = bot.send_message(
+        message.chat.id,
+        f"⏳ កំពុង​ដំណើរការ... [{platform.upper()}]"
+    )
+
+    download_dir = os.path.join(DOWNLOAD_FOLDER, f"{user.id}_{message.message_id}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(download_dir, exist_ok=True)
+    output_template = os.path.join(download_dir, "%(autonumber)03d_%(title).80s_%(id)s.%(ext)s")
+
+    try:
+        bot.edit_message_text(
+            f"⬇️ កំពុង Download... [{platform.upper()} | {request_label}]",
+            message.chat.id, msg.message_id
+        )
+
+        file_paths, err = attempt_download(
+            url,
+            output_template,
+            download_dir,
+            allow_playlist=allow_playlist,
+        )
+
+        if not file_paths:
+            reply = friendly_error(err or "Unknown error", platform)
+            bot.edit_message_text(reply, message.chat.id, msg.message_id, parse_mode="Markdown")
+            log_download(user, url, f"error: {(err or '')[:100]}", platform, 0.0)
+            return
+
+        sent = 0
+        failed = 0
+        skipped = 0
+        total_size_mb = 0.0
+        total_files = len(file_paths)
+
+        for index, file_path in enumerate(file_paths, start=1):
+            try:
+                file_size = os.path.getsize(file_path)
+                size_mb = file_size / (1024 * 1024)
+            except OSError:
+                failed += 1
+                continue
+
+            if file_size > MAX_FILE_SIZE:
+                skipped += 1
+                continue
+
+            bot.edit_message_text(
+                f"📤 កំពុង Upload... {index} / {total_files}",
+                message.chat.id, msg.message_id
+            )
+
+            caption_parts = [
+                f"✅ {size_mb:.1f} MB",
+                platform.upper(),
+                quality_label(),
+            ]
+            if allow_playlist:
+                caption_parts.append(f"{index}/{total_files}")
+            caption = " | ".join(caption_parts)
+
+            uploaded = False
+            for attempt in range(3):
+                try:
+                    send_downloaded_media(message.chat.id, file_path, caption)
+                    uploaded = True
+                    break
+                except Exception as upload_err:
+                    if attempt == 2:
+                        failed += 1
+                        print(f"[UPLOAD ERROR] {str(upload_err)[:150]}")
+                    else:
+                        bot.edit_message_text(
+                            f"⚠️ Upload ម្ដង​ទៀត {attempt + 1}/3... ({index}/{total_files})",
+                            message.chat.id, msg.message_id
+                        )
+
+            if uploaded:
+                sent += 1
+                total_size_mb += size_mb
+
+        if sent:
+            bot.edit_message_text(
+                f"✅ រួច​រាល់! Sent: {sent}, skipped: {skipped}, failed: {failed}",
+                message.chat.id, msg.message_id
+            )
+            log_download(user, url, f"success ({sent} sent, {skipped} skipped, {failed} failed)", platform, total_size_mb)
+        else:
+            bot.edit_message_text(
+                f"❌ Upload បរាជ័យ។ skipped: {skipped}, failed: {failed}",
+                message.chat.id, msg.message_id
+            )
+            log_download(user, url, f"upload failed ({skipped} skipped, {failed} failed)", platform, total_size_mb)
+    finally:
+        shutil.rmtree(download_dir, ignore_errors=True)
+
+
 # ═════════════════════════════════════════════
 #  BOT HANDLERS
 # ═════════════════════════════════════════════
@@ -422,15 +797,7 @@ def friendly_error(err: str, platform: str) -> str:
 def send_welcome(message):
     user = message.from_user
 
-    if user.id not in notified_users:
-        notified_users.add(user.id)
-        # Save new user to persistent storage
-        all_users[user.id] = {
-            "name":     f"{user.first_name}{' ' + user.last_name if user.last_name else ''}",
-            "username": user.username or "",
-            "joined":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        save_users(all_users)
+    if store_user(user):
         log_user_join(user)
 
     bot.reply_to(
@@ -442,6 +809,8 @@ def send_welcome(message):
         "• Vimeo • Dailymotion • Twitch\n"
         "• Bilibili • Streamable • Rumble\n"
         "• Pinterest • Threads • និងច្រើន​ទៀត!\n\n"
+        f"📚 Download all: `/all link` (max {MAX_ITEMS_PER_REQUEST} files)\n"
+        "🖼️ TikTok photo/live-photo posts are supported too.\n\n"
         f"📽️ Format: MP4  |  Quality: up to {quality_label()}  |  Max: {format_size(MAX_FILE_SIZE)}",
         parse_mode="Markdown"
     )
@@ -449,6 +818,10 @@ def send_welcome(message):
 
 @bot.message_handler(commands=["help"])
 def send_help(message):
+    user = message.from_user
+    if store_user(user):
+        log_user_join(user)
+
     bot.reply_to(
         message,
         "👋 *Video Downloader Bot*\n\n"
@@ -459,6 +832,8 @@ def send_help(message):
         "• Bilibili • Streamable • Rumble\n"
         "• Pinterest • Threads • និងច្រើន​ទៀត!\n\n"
         f"📽️ Format: MP4  |  Quality: up to {quality_label()}  |  Max: {format_size(MAX_FILE_SIZE)}\n\n"
+        f"📚 Download all: `/all link` (max {MAX_ITEMS_PER_REQUEST} files)\n"
+        "🖼️ TikTok photo/live-photo posts are supported too.\n\n"
         "⚠️ *TikTok/FB Private* → ត្រូវ​ការ cookies file\n\n"
         "💡 គ្រាន់​តែ​ paste link វីដេអូ​មក!",
         parse_mode="Markdown"
@@ -471,12 +846,13 @@ def send_help(message):
 
 @bot.message_handler(commands=["broadcast"])
 def broadcast(message):
+    store_user(message.from_user)
     if ADMIN_ID is None or message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "⛔ អ្នក​មិន​មាន​សិទ្ធិ​ប្រើ​ command នេះ​ទេ។")
         return
 
     # Extract the broadcast text (everything after /broadcast)
-    text = message.text.partition(" ")[2].strip()
+    text = (message.text or "").partition(" ")[2].strip()
     if not text:
         bot.reply_to(
             message,
@@ -486,7 +862,8 @@ def broadcast(message):
         )
         return
 
-    user_ids = list(all_users.keys())
+    with users_lock:
+        user_ids = list(all_users.keys())
     total    = len(user_ids)
 
     if total == 0:
@@ -545,11 +922,13 @@ def broadcast(message):
 
 @bot.message_handler(commands=["stats"])
 def stats(message):
+    store_user(message.from_user)
     if ADMIN_ID is None or message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "⛔ អ្នក​មិន​មាន​សិទ្ធិ​ប្រើ​ command នេះ​ទេ។")
         return
 
-    total = len(all_users)
+    with users_lock:
+        total = len(all_users)
     bot.reply_to(
         message,
         f"📊 *Bot Statistics*\n"
@@ -564,94 +943,20 @@ def stats(message):
 #  MAIN DOWNLOAD HANDLER
 # ═════════════════════════════════════════════
 
+@bot.message_handler(commands=["all"])
+def download_all_videos(message):
+    process_download_request(message, allow_playlist=True)
+
+
 @bot.message_handler(func=lambda message: True)
 def download_video(message):
-    url      = message.text.strip()
-    user     = message.from_user
-    is_valid, validation_error = validate_url(url)
-
-    if not is_valid:
-        bot.reply_to(message, validation_error)
+    if not getattr(message, "text", None):
+        if message.from_user:
+            store_user(message.from_user)
+        bot.reply_to(message, "Please send a video link.")
         return
 
-    platform = detect_platform(url)
-
-    msg = bot.send_message(
-        message.chat.id,
-        f"⏳ កំពុង​ដំណើរការ... [{platform.upper()}]"
-    )
-
-    size_mb : float = 0.0
-    download_dir = os.path.join(DOWNLOAD_FOLDER, f"{user.id}_{message.message_id}_{uuid.uuid4().hex[:8]}")
-    os.makedirs(download_dir, exist_ok=True)
-    output_template = os.path.join(download_dir, "%(title).80s.%(ext)s")
-
-    bot.edit_message_text(
-        f"⬇️ កំពុង Download... [{platform.upper()} | {quality_label()}]",
-        message.chat.id, msg.message_id
-    )
-
-    file_path, err = attempt_download(url, output_template, download_dir)
-
-    if file_path is None:
-        reply = friendly_error(err or "Unknown error", platform)
-        bot.edit_message_text(reply, message.chat.id, msg.message_id, parse_mode="Markdown")
-        log_download(user, url, f"error: {(err or '')[:100]}", platform, 0.0)
-        shutil.rmtree(download_dir, ignore_errors=True)
-        return
-
-    try:
-        file_size = os.path.getsize(file_path)
-        size_mb   = file_size / (1024 * 1024)
-    except OSError:
-        bot.edit_message_text("❌ File រក​មិន​ឃើញ​ក្រោយ Download។", message.chat.id, msg.message_id)
-        log_download(user, url, "error: file missing", platform)
-        shutil.rmtree(download_dir, ignore_errors=True)
-        return
-
-    if file_size > MAX_FILE_SIZE:
-        bot.edit_message_text(
-            f"❌ វីដេអូ​ធំ​ពេក ({size_mb:.1f} MB)\n"
-            f"Bot ទទួល​បាន​តែ {format_size(MAX_FILE_SIZE)} ប៉ុណ្ណោះ។",
-            message.chat.id, msg.message_id
-        )
-        log_download(user, url, f"too large ({size_mb:.1f}MB)", platform, size_mb)
-        shutil.rmtree(download_dir, ignore_errors=True)
-        return
-
-    bot.edit_message_text("📤 កំពុង Upload...", message.chat.id, msg.message_id)
-
-    upload_ok = False
-    for attempt in range(3):
-        try:
-            with open(file_path, "rb") as video:
-                bot.send_video(
-                    message.chat.id,
-                    video,
-                    timeout=600,
-                    supports_streaming=True,
-                    caption=f"✅ {size_mb:.1f} MB | {platform.upper()} | {quality_label()} | MP4"
-                )
-            upload_ok = True
-            break
-        except Exception as upload_err:
-            if attempt == 2:
-                bot.edit_message_text(
-                    f"❌ Upload បរាជ័យ: {str(upload_err)[:150]}",
-                    message.chat.id, msg.message_id
-                )
-                log_download(user, url, f"upload error: {str(upload_err)[:80]}", platform, size_mb)
-            else:
-                bot.edit_message_text(
-                    f"⚠️ Upload ម្ដង​ទៀត {attempt + 1}/3...",
-                    message.chat.id, msg.message_id
-                )
-
-    if upload_ok:
-        bot.edit_message_text("✅ រួច​រាល់!", message.chat.id, msg.message_id)
-        log_download(user, url, "success", platform, size_mb)
-
-    shutil.rmtree(download_dir, ignore_errors=True)
+    process_download_request(message, allow_playlist=False)
 
 
 print("Bot is running...")

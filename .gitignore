@@ -1,6 +1,7 @@
 .env
 .env/
 users.json
+users.json.tmp
 __pycache__/
 *.py[cod]
 downloads/
