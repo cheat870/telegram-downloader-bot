@@ -1,8 +1,12 @@
 import os
+import html
 import json
+import mimetypes
 import shutil
 import threading
 import uuid
+import re
+import requests
 import telebot
 from yt_dlp import YoutubeDL
 from typing import Any
@@ -51,6 +55,7 @@ COOKIES = {
 
 USERS_FILE = "users.json"
 DATABASE_URL = os.getenv("DATABASE_URL")
+URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 
 
 def read_positive_int_env(name: str, default: int) -> int:
@@ -342,11 +347,27 @@ def log_download(user, url: str, status: str, platform: str = "?", size_mb: floa
 #  PLATFORM DETECTION
 # ═════════════════════════════════════════════
 
+def clean_url(url: str) -> str:
+    return url.strip().strip("<>()[]{}\"'`.,;")
+
+
+def first_url_from_text(text: str) -> str:
+    match = URL_RE.search(text or "")
+    if not match:
+        url = clean_url(text)
+    else:
+        url = clean_url(match.group(0))
+
+    if url and not urlparse(url).scheme and "." in url.split("/", 1)[0]:
+        return f"https://{url}"
+    return url
+
+
 def detect_platform(url: str) -> str:
-    hostname = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    hostname = (urlparse(clean_url(url)).hostname or "").lower().removeprefix("www.")
     domains = {
         "youtube":     ("youtube.com", "youtu.be"),
-        "tiktok":      ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
+        "tiktok":      ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com"),
         "facebook":    ("facebook.com", "fb.watch", "fb.com"),
         "instagram":   ("instagram.com",),
         "twitter":     ("twitter.com", "x.com"),
@@ -369,7 +390,7 @@ def detect_platform(url: str) -> str:
 
 
 def validate_url(url: str) -> tuple[bool, str]:
-    parsed = urlparse(url)
+    parsed = urlparse(clean_url(url))
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return False, "Invalid URL. Please send a valid http/https link."
     if parsed.username or parsed.password:
@@ -548,6 +569,161 @@ def resolve_file_path(ydl: YoutubeDL, info_dict: dict, download_dir: str) -> str
     return None
 
 
+def get_url_list(value: Any) -> list[str]:
+    if isinstance(value, str) and value.startswith("http"):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str) and item.startswith("http")]
+    if isinstance(value, dict):
+        for key in ("urlList", "url_list", "urls", "url"):
+            urls = get_url_list(value.get(key))
+            if urls:
+                return urls
+    return []
+
+
+def iter_tiktok_items(value: Any):
+    if isinstance(value, dict):
+        if ("imagePost" in value or "video" in value) and ("id" in value or "desc" in value):
+            yield value
+        for child in value.values():
+            yield from iter_tiktok_items(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_tiktok_items(child)
+
+
+def parse_tiktok_json_objects(page_html: str) -> list[Any]:
+    objects: list[Any] = []
+    script_patterns = (
+        r'<script[^>]+id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>',
+        r'<script[^>]+id=["\']__UNIVERSAL_DATA_FOR_REHYDRATION__["\'][^>]*>(.*?)</script>',
+    )
+
+    for pattern in script_patterns:
+        for match in re.finditer(pattern, page_html, flags=re.DOTALL | re.IGNORECASE):
+            raw_json = html.unescape(match.group(1)).strip()
+            try:
+                objects.append(json.loads(raw_json))
+            except json.JSONDecodeError as e:
+                print(f"[TIKTOK JSON ERROR] {e}")
+
+    return objects
+
+
+def collect_tiktok_item_media_urls(item: dict) -> list[str]:
+    urls: list[str] = []
+
+    image_post = item.get("imagePost")
+    if isinstance(image_post, dict):
+        for image in image_post.get("images") or []:
+            if not isinstance(image, dict):
+                continue
+            for key in ("imageURL", "imageUrl", "displayImage"):
+                urls.extend(get_url_list(image.get(key)))
+
+    video = item.get("video")
+    if isinstance(video, dict):
+        for key in ("downloadAddr", "playAddr", "playApi", "dynamicCover", "originCover"):
+            urls.extend(get_url_list(video.get(key)))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append(url)
+    return deduped
+
+
+def media_extension(url: str, content_type: str | None, default_ext: str = ".jpg") -> str:
+    guessed = None
+    if content_type:
+        guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
+    if guessed in {".jpe", ".jpeg"}:
+        return ".jpg"
+    if guessed in VIDEO_EXTENSIONS | PHOTO_EXTENSIONS | AUDIO_EXTENSIONS:
+        return guessed
+
+    path_ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if path_ext in VIDEO_EXTENSIONS | PHOTO_EXTENSIONS | AUDIO_EXTENSIONS:
+        return path_ext
+    return default_ext
+
+
+def download_media_url(session: requests.Session, url: str, output_dir: str, index: int) -> str | None:
+    try:
+        response = session.get(url, stream=True, timeout=45)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        default_ext = ".mp4" if content_type.startswith("video/") else ".jpg"
+        ext = media_extension(url, content_type, default_ext)
+        path = os.path.join(output_dir, f"tiktok_media_{index:03d}{ext}")
+
+        downloaded = 0
+        with open(path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                downloaded += len(chunk)
+                if downloaded > MAX_FILE_SIZE:
+                    raise ValueError("TikTok media file is larger than the configured max size")
+                f.write(chunk)
+        return path if is_sendable_file(path) else None
+    except Exception as e:
+        print(f"[TIKTOK MEDIA DOWNLOAD ERROR] {e}")
+        return None
+
+
+def download_tiktok_photo_fallback(url: str, download_dir: str) -> list[str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+    }
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    if os.path.exists(COOKIES["tiktok"]):
+        print("[TIKTOK FALLBACK] Cookie file exists but fallback uses browser headers only")
+
+    try:
+        page = session.get(clean_url(url), timeout=45, allow_redirects=True)
+        page.raise_for_status()
+    except Exception as e:
+        print(f"[TIKTOK FALLBACK PAGE ERROR] {e}")
+        return []
+
+    media_urls: list[str] = []
+    seen: set[str] = set()
+    for data in parse_tiktok_json_objects(page.text):
+        for item in iter_tiktok_items(data):
+            for media_url in collect_tiktok_item_media_urls(item):
+                if media_url in seen:
+                    continue
+                seen.add(media_url)
+                media_urls.append(media_url)
+                if len(media_urls) >= MAX_ITEMS_PER_REQUEST:
+                    break
+            if len(media_urls) >= MAX_ITEMS_PER_REQUEST:
+                break
+        if len(media_urls) >= MAX_ITEMS_PER_REQUEST:
+            break
+
+    paths: list[str] = []
+    for index, media_url in enumerate(media_urls, start=1):
+        path = download_media_url(session, media_url, download_dir, index)
+        if path:
+            paths.append(path)
+    return paths
+
+
 def attempt_download(
     url: str,
     output_template: str,
@@ -606,6 +782,12 @@ def attempt_download(
     except Exception as e:
         last_error = str(e)
         print(f"[FAILED] Ultra-bare → {last_error[:120]}")
+
+    if detect_platform(url) == "tiktok":
+        print("[ATTEMPT] TikTok photo/live-photo fallback")
+        paths = download_tiktok_photo_fallback(url, download_dir)
+        if paths:
+            return paths[:MAX_ITEMS_PER_REQUEST], None
 
     return [], last_error
 
@@ -666,8 +848,8 @@ def send_downloaded_media(chat_id: int, file_path: str, caption: str) -> None:
 def extract_request_url(message, allow_playlist: bool) -> str:
     text = (message.text or "").strip()
     if allow_playlist:
-        return text.partition(" ")[2].strip()
-    return text
+        return first_url_from_text(text.partition(" ")[2].strip())
+    return first_url_from_text(text)
 
 
 def process_download_request(message, allow_playlist: bool = False) -> None:
