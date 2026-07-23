@@ -1,5 +1,6 @@
 import os
 import html
+import hashlib
 import json
 import mimetypes
 import shutil
@@ -582,6 +583,11 @@ def get_url_list(value: Any) -> list[str]:
     return []
 
 
+def first_media_url(value: Any) -> str | None:
+    urls = get_url_list(value)
+    return urls[0] if urls else None
+
+
 def iter_tiktok_items(value: Any):
     if isinstance(value, dict):
         if ("imagePost" in value or "video" in value) and ("id" in value or "desc" in value):
@@ -620,20 +626,33 @@ def collect_tiktok_item_media_urls(item: dict) -> list[str]:
             if not isinstance(image, dict):
                 continue
             for key in ("imageURL", "imageUrl", "displayImage"):
-                urls.extend(get_url_list(image.get(key)))
+                url = first_media_url(image.get(key))
+                if url:
+                    urls.append(url)
+                    break
+
+        if urls:
+            return dedupe_ordered(urls)
 
     video = item.get("video")
     if isinstance(video, dict):
-        for key in ("downloadAddr", "playAddr", "playApi", "dynamicCover", "originCover"):
-            urls.extend(get_url_list(video.get(key)))
+        for key in ("downloadAddr", "playAddr", "playApi"):
+            url = first_media_url(video.get(key))
+            if url:
+                urls.append(url)
+                break
 
+    return dedupe_ordered(urls)
+
+
+def dedupe_ordered(items: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
-    for url in urls:
-        if url in seen:
+    for item in items:
+        if item in seen:
             continue
-        seen.add(url)
-        deduped.append(url)
+        seen.add(item)
+        deduped.append(item)
     return deduped
 
 
@@ -676,6 +695,40 @@ def download_media_url(session: requests.Session, url: str, output_dir: str, ind
         return None
 
 
+def file_sha256(path: str) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError as e:
+        print(f"[HASH ERROR] {e}")
+        return None
+
+
+def unique_file_paths(paths: list[str]) -> list[str]:
+    unique: list[str] = []
+    seen_hashes: set[str] = set()
+    seen_names: set[str] = set()
+
+    for path in paths:
+        name = os.path.basename(path).lower()
+        digest = file_sha256(path)
+        marker = digest or name
+        if marker in seen_hashes or name in seen_names:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        seen_hashes.add(marker)
+        seen_names.add(name)
+        unique.append(path)
+
+    return unique
+
+
 def download_tiktok_photo_fallback(url: str, download_dir: str) -> list[str]:
     headers = {
         "User-Agent": (
@@ -702,6 +755,7 @@ def download_tiktok_photo_fallback(url: str, download_dir: str) -> list[str]:
 
     media_urls: list[str] = []
     seen: set[str] = set()
+    candidate_limit = MAX_ITEMS_PER_REQUEST * 4
     for data in parse_tiktok_json_objects(page.text):
         for item in iter_tiktok_items(data):
             for media_url in collect_tiktok_item_media_urls(item):
@@ -709,11 +763,11 @@ def download_tiktok_photo_fallback(url: str, download_dir: str) -> list[str]:
                     continue
                 seen.add(media_url)
                 media_urls.append(media_url)
-                if len(media_urls) >= MAX_ITEMS_PER_REQUEST:
+                if len(media_urls) >= candidate_limit:
                     break
-            if len(media_urls) >= MAX_ITEMS_PER_REQUEST:
+            if len(media_urls) >= candidate_limit:
                 break
-        if len(media_urls) >= MAX_ITEMS_PER_REQUEST:
+        if len(media_urls) >= candidate_limit:
             break
 
     paths: list[str] = []
@@ -721,7 +775,7 @@ def download_tiktok_photo_fallback(url: str, download_dir: str) -> list[str]:
         path = download_media_url(session, media_url, download_dir, index)
         if path:
             paths.append(path)
-    return paths
+    return unique_file_paths(paths)[:MAX_ITEMS_PER_REQUEST]
 
 
 def attempt_download(
@@ -901,6 +955,12 @@ def process_download_request(message, allow_playlist: bool = False) -> None:
             reply = friendly_error(err or "Unknown error", platform)
             bot.edit_message_text(reply, message.chat.id, msg.message_id, parse_mode="Markdown")
             log_download(user, url, f"error: {(err or '')[:100]}", platform, 0.0)
+            return
+
+        file_paths = unique_file_paths(file_paths)[:MAX_ITEMS_PER_REQUEST]
+        if not file_paths:
+            bot.edit_message_text("❌ No unique media files found after download.", message.chat.id, msg.message_id)
+            log_download(user, url, "error: duplicate media only", platform, 0.0)
             return
 
         sent = 0
