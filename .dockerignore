@@ -1,0 +1,10 @@
+.git
+__pycache__/
+*.py[cod]
+downloads/
+users.json
+users.json.tmp
+*_cookies.txt
+.env
+.env.*
+telegram-downloader-bot/
