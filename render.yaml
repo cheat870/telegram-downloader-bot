@@ -2,7 +2,7 @@ services:
   - type: worker
     name: telegram-downloader-bot
     runtime: python
-    plan: free
+    plan: starter
     region: singapore
     branch: main
     autoDeploy: true
